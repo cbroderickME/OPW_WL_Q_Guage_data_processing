@@ -1,207 +1,271 @@
 ################################################################################
-## Program to download long term hydro data from the OPW
+## OPW Long-Term Water Level Data Downloader - Full Script with RDS Storage
+##
+## Purpose:
+## - Downloads long-term water level data from OPW (waterlevel.ie)
+## - Produces datasets at multiple time resolutions:
+##     1. Raw 15-min
+##     2. Interpolated 15-min series
+##     3. Hourly
+##     4. Daily 00–00
+##     5. Daily 09–09
+## - Computes proportion of missing values
+## - Logs first/last timestamps, first regular 15-min block, and % missing
+## - Saves all datasets as RDS and CSV
+## - Generates interactive Plotly plot of past year for each gauge
+##
+## QC Codes:
+## 31: Inspected water level, approved for general use
+## 32: Corrected version of Code 31
+## 41: Poor measured water level
+## 42: Corrected version of Code 41
+## 101: Unreliable water level
+## 151: Unusable (dry/logging error)
+## 254: Unchecked imported water level, provisional
+## 255: Missing / no data available
+##
+## Requirements:
+## - R packages: httr, jsonlite, dplyr, stringr, lubridate, zoo, tibble, plotly, htmlwidgets
 ################################################################################
 
 rm(list = ls()); gc()
-
-# set time
 Sys.setenv(TZ = "GMT")
 
-### load libraries
-if (!require("pacman")) install.packages("pacman")
-pacman::p_load("readxl","lubridate","statar","httr","rjson","jsonlite","dplyr","stringr", "RANN", "here")
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(stringr)
+library(lubridate)
+library(zoo)
+library(tibble)
+library(plotly)
+library(htmlwidgets)
 
+################################################################################
+# USER SETTINGS
+################################################################################
+allowed_missing_hourly_pct <- 25   # % missing allowed per hour
+allowed_missing_daily_pct  <- 5    # % missing allowed per day
+plot_gauge_id <- 1041              # Optional: single gauge for plotting
 
-# Define working directory
-wkdir <- file.path("C:", "Users", "CBroderick", "Downloads", "OPW", "wkdir")
+################################################################################
+# DERIVED THRESHOLDS
+################################################################################
+intervals_per_hour <- 4             # 15-min intervals per hour
+intervals_per_day  <- 96            # 15-min intervals per day
+max_missing_hourly <- floor(intervals_per_hour * allowed_missing_hourly_pct / 100)
+max_missing_daily  <- floor(intervals_per_day * allowed_missing_daily_pct / 100)
 
-# Create directory if it doesn't exist
-if (!dir.exists(wkdir)) {
-  dir.create(wkdir, recursive = TRUE)
-}
-
-### set working directory
+################################################################################
+# WORKING DIRECTORIES
+################################################################################
+wkdir <- file.path("C:", "Users", "CBroderick", "Downloads", "OPW")
+if (!dir.exists(wkdir)) dir.create(wkdir, recursive = TRUE)
 setwd(wkdir)
-dir.create(paste0(wkdir, "/WL_Output_", Sys.Date()))
-dir.create(paste0(wkdir, "/WL_Output_", Sys.Date() ,"/Gauges"))
-dir.create(paste0(wkdir, "/WL_Output_", Sys.Date() ,"/log"))
 
-### Get a list of all the potential gauges available
-sensors <- list(code = c( "0001", "0002", "0003", "OD"), name = c("level", "temp", "voltage", "datum") )
-# JSON
-station_details_url<- 'https://waterlevel.ie/geojson/'
-data_stations <- GET(station_details_url)
-data_json <- content(data_stations, as = "text",encoding = "UTF-8")
-jfile <- fromJSON(data_json)
-df_station_details <- as.data.frame(jfile)
-colnames(df_station_details)
-make_station_details <- function(id,coords, name)
-{
-  stations <- list()
-  stations$id <- str_sub( id , -5,-1)
-  temp <- unlist(coords)
-  stations$long<- temp[c(TRUE,FALSE)]
-  stations$lat <- temp[c(FALSE,TRUE)]
-  stations$name <- name
-  return( as.data.frame(stations) )
-}
-mystations<- make_station_details(df_station_details$features.properties$ref , df_station_details$features.geometry$coordinates %>% as.vector() , df_station_details$features.properties$name)
+out_dir <- file.path(wkdir, paste0("WL_Output_", Sys.Date()))
+dir.create(out_dir, showWarnings = FALSE)
+dir.create(file.path(out_dir, "Gauges"), showWarnings = FALSE)
+dir.create(file.path(out_dir, "log"), showWarnings = FALSE)
 
-gauge_lst = as.numeric(as.character(mystations$id))
-gauge_lst_nme = as.character(mystations$name)
+################################################################################
+# GET GAUGE LIST
+################################################################################
+station_details_url <- 'https://waterlevel.ie/geojson/'
+jfile <- fromJSON(content(GET(station_details_url), as = "text", encoding = "UTF-8"))
 
-# save a list of the gauges with download data available
-gauge_process_lst = matrix(NA, length(gauge_lst), 1)
-gauge_process_lst_nme = matrix(NA, length(gauge_lst), 1)
-gauge_process_log = matrix(NA, length(gauge_lst), 1)
-gauge_process_LnkStatus_wl=matrix(NA, length(gauge_lst), 1)
-gauge_process_LnkStatus_HD=matrix(NA, length(gauge_lst), 1)
+mystations <- tibble(
+  id   = as.numeric(str_sub(jfile$features$properties$ref, -5, -1)),
+  name = jfile$features$properties$name
+)
 
-# run a loop to download all datasets from OPW website
-# the program works by attempting to download the data for all stations
-# if they are not processed successfully then they are assumed not to have the required data sets
-# Information on whether a gauge was processed successfully is stored in a log file
+gauge_lst <- mystations$id
+gauge_lst_nme <- mystations$name
 
-for (val in seq(from=1, to=length(gauge_lst))){
+################################################################################
+# INITIALISE LOG
+################################################################################
+log_tbl <- tibble(
+  Gauge_ID = gauge_lst,
+  Gauge_Name = gauge_lst_nme,
+  LinkStatus_HD = NA,
+  First_Valid_Timestamp = NA,
+  First_Regular_15min_Timestamp = NA,
+  Start_Date = NA,
+  End_Date = NA,
+  Prop_Missing_15min = NA,
+  Prop_Missing_Hourly = NA,
+  Prop_Missing_Daily_00_00 = NA,
+  Prop_Missing_Daily_09_09 = NA,
+  Data_Regularity = NA,
+  Processed = NA
+)
+
+#gauge_lst=1041
+################################################################################
+# MAIN LOOP (DOWNLOAD + PROCESS)
+################################################################################
+for (val in seq_along(gauge_lst)) {
+ # val=1
+  gauge_sel <- gauge_lst[val]
+  gauge_sel_adj <- str_pad(gauge_sel, 5, pad = "0")
+  cat("Processing gauge:", gauge_sel, "\n")
   
-  print(val)
-  gauge_sel<-gauge_lst[val]
-  gauge_sel_adj<-str_pad(gauge_sel, 5, "pad"=0)
+  dest_dir <- file.path(out_dir, "Gauges", paste0("GaugeID_", gauge_sel))
+  dir.create(dest_dir, showWarnings = FALSE)
+  setwd(dest_dir)
   
-  source<-paste0("http://waterlevel.ie/hydro-data/data/internet/stations/0/", gauge_sel_adj, "/S/Waterlevel_complete.zip")
-  LnkHD<-httr::GET(source)
-  print(gauge_sel)
-  print(LnkHD)
-  gauge_process_LnkStatus_HD[val]<-LnkHD$status_code
-
+  source <- paste0(
+    "http://waterlevel.ie/hydro-data/data/internet/stations/0/",
+    gauge_sel_adj, "/S/Waterlevel_complete.zip"
+  )
+  
+  response <- GET(source)
+  log_tbl$LinkStatus_HD[val] <- response$status_code
+  if (response$status_code != 200) {
+    log_tbl$Processed[val] <- "Download_Failed"
+    next
+  }
+  
   tryCatch({
-    gauge_sel<-gauge_lst[val]
-    gauge_sel_adj<-str_pad(gauge_sel, 5, "pad"=0)
-    gauge_process_lst[val]<-gauge_lst[val]
-    gauge_process_lst_nme[val]<-gauge_lst_nme[val]
-
-    ######## Record the gauge ID
-    dest_dir<-paste0(wkdir, "/WL_Output_", Sys.Date() ,"/Gauges/GaugeID_", gauge_sel)
-    dir.create(dest_dir)
-    setwd(dest_dir)
-
-    ######## Download long term stage height above OD from HYDRO-DATA -----------------------------
-    download.file(source, destfile = "Waterlevel_complete.zip", quiet = TRUE)
-
-    ######## unzip and load file
+    # DOWNLOAD + READ RAW
+    download.file(source, "Waterlevel_complete.zip", quiet = TRUE)
     unzip("Waterlevel_complete.zip")
-    file.remove("Waterlevel_complete.zip")
+    files <- list.files(pattern = "tsvalues")
+    complete <- read.csv(files, sep = ";", skip = 10)
+    file.remove(files)
     
-    complete<-read.csv(list.files(pattern = glob2rx("tsvalues*")), sep=";", skip=10, header=TRUE)
-    complete<-as_tibble(complete)
-    file.remove(list.files(pattern = glob2rx("tsvalues*")))
-
-    ######## Convert Timestamptime format
-    complete$Timestamp = as_datetime(complete$X.Timestamp, tz = 'GMT')
-
-    ######## sort data based on the Timestampstamp
-    comp_series_srt_id <- rev(order(as.numeric(complete$Timestamp)))
-    comp_series_srt = complete[comp_series_srt_id,]
-
-    ### set up datasets to write
-    Level_raw<-comp_series_srt$Value
-    Timestamp_raw <- comp_series_srt$Timestamp
-    Quality_raw <- comp_series_srt$Quality.Code
-
-    # create a dataframe with data to save
-    comp_series_raw <- cbind.data.frame(Timestamp_raw, Level_raw, Quality_raw)
-
-    #write out as RDS file
-    saveRDS(comp_series_raw, 'Raw_Level.rds')
-
-    ########################### PROCESS INTERPOLATED AND INFILLED DATASETS ######################################
-    ######## Actual time stamp
-    act_ts = comp_series_srt$Timestamp
-
-    ######## create artifical time stamp (from 1940 to current time) and merge
-    gen_ts = rev(seq(ymd_hm('1940-06-01 00:00', tz = "GMT"), Sys.time()+days(15), by = '15 mins'))
-    gen_ts = lubridate::round_date(gen_ts, "15 minutes")
-
-    # linearly interpolate
-    y_query= approx(comp_series_srt$Timestamp, comp_series_srt$Value, gen_ts, method="linear", rule=1)
-
-    # find the distance of each query point to the  nearest observed point in minutes
-    x_query_nn<-nn2(data=comp_series_srt$Timestamp, query=y_query$x, k=1)
-    x_query_nn$nn.dists=x_query_nn$nn.dists/60
-
-    # if the distance between the  query point and  the  nearest observed point is >25 mins then
-    # recode the interpolated point as nan
-    y_query_rm<-x_query_nn$nn.dists>15
-    y_query$y[y_query_rm]=NA
-
-    # tidy up
-    comp_series_interp<-as.data.frame(cbind(y_query$x, y_query$y))
-    names(comp_series_interp)<-c('Timestamp', 'Value')
-    comp_series_interp<-as_tibble(comp_series_interp)
-    comp_series_interp$Timestamp<-as.POSIXct(comp_series_interp$Timestamp, origin='1970-01-01')
-
-    ### set up datasets to write
-    Levels_interp<-comp_series_interp$Value
-    Timestamp_interp <- comp_series_interp$Timestamp
-
-    # create a dataframe with data to save
-    comp_series_interp <- cbind.data.frame(Timestamp_interp, Levels_interp)
-
-    #write out as RDS file
-    saveRDS(comp_series_interp, 'Interp_Level.rds')
+    complete$Timestamp <- as_datetime(complete$X.Timestamp, tz="GMT")
     
-    ### DAILY INTERPOLATION - Equivalent to Python's resample('D').mean(), min 18 hours of data, no interpolation
+    # QC Filtering
+    qc_include <- c(31, 32, 41, 42, 101, 254)
+    comp_raw <- complete %>%
+      transmute(Timestamp = Timestamp, Level = Value, Quality = Quality.Code) %>%
+      arrange(Timestamp) %>%
+      filter(!is.na(Level), Quality %in% qc_include)
     
-    # Aggregate 15-min interpolated data to daily means
-    # Require at least 12 hours = 48 valid 15-min observations per day
-    comp_series_daily <- comp_series_interp %>%
-      mutate(Date = as.Date(Timestamp_interp)) %>%
-      group_by(Date) %>%
+    # Log first valid timestamp
+    log_tbl$First_Valid_Timestamp[val] <- min(comp_raw$Timestamp)
+    
+    # Identify first regular 15-min block
+    dt_diff <- diff(as.numeric(comp_raw$Timestamp))/60
+    is_15 <- dt_diff == 15
+    rle_15 <- rle(is_15)
+    idx_run <- which(rle_15$values == TRUE & rle_15$lengths >= 4)
+    if (length(idx_run) > 0) {
+      run_start <- sum(rle_15$lengths[seq_len(idx_run[1]-1)]) + 1
+      log_tbl$First_Regular_15min_Timestamp[val] <- comp_raw$Timestamp[run_start]
+      log_tbl$Data_Regularity[val] <- "Regular"
+    } else {
+      log_tbl$Data_Regularity[val] <- "Irregular"
+    }
+    
+    # Start/End dates
+    start_time <- min(comp_raw$Timestamp, na.rm=TRUE)
+    end_time   <- max(comp_raw$Timestamp, na.rm=TRUE)
+    log_tbl$Start_Date[val] <- start_time
+    log_tbl$End_Date[val]   <- end_time
+    
+    # 15-min interpolation
+    full_ts <- seq(start_time, end_time, by = "15 min")
+    comp_15min <- tibble(Timestamp = full_ts) %>%
+      left_join(comp_raw %>% select(Timestamp, Level), by = "Timestamp")
+    comp_15min$Level <- zoo::na.approx(comp_15min$Level, x=comp_15min$Timestamp,
+                                       maxgap=1, na.rm=FALSE)
+    log_tbl$Prop_Missing_15min[val] <- mean(is.na(comp_15min$Level))
+    
+    # Hourly aggregation
+    hourly <- comp_15min %>%
+      mutate(Hour = floor_date(Timestamp, "hour")) %>%
+      group_by(Hour) %>%
       summarise(
-        n_values = sum(!is.na(Levels_interp)),
-        Level_m = if_else(n_values >= 72,  # 12 hours × 4 = 72 intervals
-                                mean(Levels_interp, na.rm = TRUE),
-                                NA_real_)
+        n_total = n(), n_valid = sum(!is.na(Level)),
+        Level = if_else((n_total - n_valid) <= max_missing_hourly,
+                        mean(Level, na.rm=TRUE),
+                        NA_real_)
       ) %>%
       ungroup()
+    hourly$Level <- na.approx(hourly$Level, maxgap=3, na.rm=FALSE)
+    log_tbl$Prop_Missing_Hourly[val] <- mean(is.na(hourly$Level))
+
     
-    # Rename for consistency (optional, already Level_m)
-    colnames(comp_series_daily) <- c("Date", "Level_m")
-    
-    # Save daily discharge without interpolation of missing days
-    saveRDS(comp_series_daily, 'Daily_Level_00_00.rds')
-    write.csv(comp_series_daily, 'Daily_Level_00_00.csv', row.names = FALSE)    
-    
-    
-    ### DAILY MEAN LEVEL BETWEEN 09:00 DAY 1 AND 09:00 DAY 2     ### Timestamped as DAY 1     ### No interpolation, minimum 18 hours of valid data
-    
-    library(lubridate)
-    
-    comp_series_daily <- comp_series_interp %>%
-      mutate(
-        Date = as.Date(Timestamp_interp - hours(9))
-      ) %>%
+    # Daily 00–00
+    daily_00 <- comp_15min %>%
+      mutate(Date = as.Date(Timestamp)) %>%
       group_by(Date) %>%
       summarise(
-        n_values = sum(!is.na(Levels_interp)),
-        Level_m = if_else(
-          n_values >= 72,  # 18 hours × 4 (15-min data)
-          mean(Levels_interp, na.rm = TRUE),
-          NA_real_
-        )
+        n_missing = sum(is.na(Level)),
+        Level = if_else(n_missing <= max_missing_daily, mean(Level, na.rm=TRUE), NA_real_)
       ) %>%
       ungroup()
+    log_tbl$Prop_Missing_Daily_00_00[val] <- mean(is.na(daily_00$Level))
+
     
-    saveRDS(comp_series_daily, "Daily_Level_09_09.rds")
-    write.csv(comp_series_daily, "Daily_Level_09_09.csv", row.names = FALSE)
+    # Daily 09–09
+    daily_09 <- comp_15min %>%
+      mutate(Date = as.Date(Timestamp - hours(9))) %>%
+      group_by(Date) %>%
+      summarise(
+        n_missing = sum(is.na(Level)),
+        Level = if_else(n_missing <= max_missing_daily, mean(Level, na.rm=TRUE), NA_real_)
+      ) %>%
+      ungroup()
+    log_tbl$Prop_Missing_Daily_09_09[val] <- mean(is.na(daily_09$Level))
     
-    #save whether the gauge data was processed
-    gauge_process_log[val] = TRUE 
-  }, error=function(e){})
+    
+    saveRDS(daily_09, file.path(dest_dir, "Daily_Level_09_09.rds"))
+    saveRDS(comp_raw, file.path(dest_dir, "Raw_Level.rds"))
+    saveRDS(comp_15min, file.path(dest_dir, "Interp_15min_Level.rds"))
+    saveRDS(hourly, file.path(dest_dir, "Hourly_Level.rds"))    
+    saveRDS(daily_00, file.path(dest_dir, "Daily_Level_00_00.rds"))    
+    
+    
+    log_tbl$Processed[val] <- TRUE
+    
+    ################################################################################
+    # PLOTLY PLOT FOR PAST YEAR (15-min, hourly, daily 00-00, daily 09-09)
+    ################################################################################
+    start_plot <- end_time - 365*24*60*60  # last 365 days from last valid timestamp
+    comp_raw_plot<- subset(tibble(comp_raw), Timestamp >= start_plot)
+    reg15_plot <- subset(comp_15min, Timestamp >= start_plot)
+    hourly_plot <- subset(hourly, Hour >= start_plot)
+    daily00_plot <- subset(daily_00, Date >= start_plot)
+    daily09_plot <- subset(daily_09, Date >= start_plot)
+    
+    fig <- plot_ly() %>%
+      add_lines(x = comp_raw_plot$Timestamp, y = comp_raw_plot$Level, name = "15-min",
+                line = list(color='grey', width=1.5)) %>%
+      add_lines(x = reg15_plot$Timestamp, y = reg15_plot$Level, name = "15-min",
+                line = list(color='blue', width=1.5)) %>%
+      add_lines(x = hourly_plot$Hour, y = hourly_plot$Level, name = "Hourly",
+                line = list(color='green', width=2)) %>%
+      add_lines(x = daily00_plot$Date, y = daily00_plot$Level, name = "Daily 00-00",
+                line = list(color='red', width=2, dash='dash')) %>%
+      add_lines(x = daily09_plot$Date, y = daily09_plot$Level, name = "Daily 09-09",
+                line = list(color='orange', width=2, dash='dot')) %>%
+      layout(title = paste("Level - Gauge", gauge_sel),
+             xaxis = list(title = "Date"),
+             yaxis = list(title = "Level (m)"))
+    
+    html_file <- file.path(dest_dir, paste0("Gauge_", gauge_sel, "_Year_from_end_date.html"))
+    htmlwidgets::saveWidget(fig, html_file)
+    cat("Plot saved to:", html_file, "\n")
+    
+  }, error = function(e) {
+    log_tbl$Processed[val] <- "Error"
+  })
 }
 
-## write log file to show which gauges were processed
-log_processed<-as.data.frame(cbind(unlist(gauge_process_lst), unlist(gauge_process_lst_nme), as.character(gauge_process_log), unlist(gauge_process_LnkStatus_wl), unlist(gauge_process_LnkStatus_HD)))
-names(log_processed)<-c("Gauge_ID",  "Gauge_Name",  "If_Processed", "Status on wl.ie", "Status on HD complete")
-write.csv(log_processed, paste0(wkdir, "/WL_Output_", Sys.Date() ,"/log/", "Log_Processed_LTermObs_StgHght.csv", sep=""), row.names = FALSE)
+################################################################################
+# SAVE LOG (with proper datetime format)
+################################################################################
+log_tbl_out <- log_tbl %>%
+  mutate(
+    First_Valid_Timestamp = format(as.POSIXct(First_Valid_Timestamp, tz="GMT"), "%Y-%m-%d %H:%M:%S"),
+    First_Regular_15min_Timestamp = format(as.POSIXct(First_Regular_15min_Timestamp, tz="GMT"), "%Y-%m-%d %H:%M:%S"),
+    Start_Date = format(as.POSIXct(Start_Date, tz="GMT"), "%Y-%m-%d %H:%M:%S"),
+    End_Date = format(as.POSIXct(End_Date, tz="GMT"), "%Y-%m-%d %H:%M:%S")
+  )
 
+write.csv(log_tbl_out, file.path(out_dir, "log", "Log_Processed_LTermObs_Level.csv"), row.names=FALSE)
+cat("Processing complete.\n")
